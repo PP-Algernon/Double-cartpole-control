@@ -35,7 +35,7 @@ class BPNetwork(nn.Module):
         self,
         input_dim: int = 4,
         hidden_dim: int = 64,
-        gain_limits: Iterable[float] = (2.0, 0.05, 0.2),
+        gain_limits: Iterable[float] = (3.0, 0.05, 0.4),
         initial_gains: Iterable[float] = (1.0, 0.0, 0.0),
     ) -> None:
         super().__init__()
@@ -99,8 +99,8 @@ class BPPIDController:
         initial_gains: Iterable[float] = (1.0, 0.0, 0.0),
         error_weights: Iterable[float] = (
             -2.73093865,
-            14.2876764,
-            -19.57212661,
+            44.2876764,
+            -79.57212661,
             1.08134621,
             0.56824623,
             1.05017658,
