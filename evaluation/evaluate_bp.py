@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import os
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +59,24 @@ def parse_args() -> argparse.Namespace:
         help="记录每一步诊断信息的可选CSV文件路径。",
     )
     parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="保存本次实验所有输出的目录；会自动生成 steps.csv、summary.json 和 figures/。",
+    )
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        default=None,
+        help="保存本次评估摘要和参数配置的JSON路径。",
+    )
+    parser.add_argument(
+        "--plot-dir",
+        type=Path,
+        default=None,
+        help="根据逐步CSV保存曲线图的目录。",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         choices=["cpu", "cuda"],
@@ -70,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=5e-6,
         help="在线BP学习率。",
     )
     parser.add_argument(
@@ -84,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs=3,
         metavar=("KP_MAX", "KI_MAX", "KD_MAX"),
-        default=(2.0, 0.05, 0.2),
+        default=(3.0, 0.05, 0.4),
         help="BP网络输出的PID增益上限。",
     )
     parser.add_argument(
@@ -106,13 +127,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--integral-limit",
         type=float,
-        default=0.5,
+        default=0.35,
         help="PID积分项限幅。",
     )
     parser.add_argument(
         "--derivative-limit",
         type=float,
-        default=8.0,
+        default=6.0,
         help="PID微分项限幅。",
     )
     parser.add_argument(
@@ -128,6 +149,30 @@ def parse_args() -> argparse.Namespace:
         help="第二根摆杆的固定初始角度,单位为度。",
     )
     return parser.parse_args()
+
+
+def _json_safe(value: Any) -> Any:
+    """将命令行参数转换为可JSON序列化的值。"""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _resolve_output_paths(args: argparse.Namespace) -> None:
+    """根据 run-dir 补齐CSV、JSON和图像输出路径。"""
+    if args.run_dir is None:
+        return
+    args.run_dir.mkdir(parents=True, exist_ok=True)
+    if args.csv is None:
+        args.csv = args.run_dir / "steps.csv"
+    if args.summary_json is None:
+        args.summary_json = args.run_dir / "summary.json"
+    if args.plot_dir is None:
+        args.plot_dir = args.run_dir / "figures"
 
 
 def _csv_writer(path: Path | None) -> tuple[Any | None, csv.DictWriter | None]:
@@ -163,6 +208,140 @@ def _csv_writer(path: Path | None) -> tuple[Any | None, csv.DictWriter | None]:
     return handle, writer
 
 
+def _read_step_csv(path: Path) -> dict[str, list[float]]:
+    """读取逐步诊断CSV，返回列数据。"""
+    columns: dict[str, list[float]] = {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            for key, value in row.items():
+                if key not in columns:
+                    columns[key] = []
+                if value in ("True", "False"):
+                    columns[key].append(float(value == "True"))
+                else:
+                    columns[key].append(float(value))
+    return columns
+
+
+def _plot_step_csv(csv_path: Path, plot_dir: Path) -> list[Path]:
+    """根据逐步CSV生成常用诊断曲线。"""
+    os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp/matplotlib-double-cartpole")))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    data = _read_step_csv(csv_path)
+    if not data:
+        return []
+
+    episode = np.asarray(data["episode"], dtype=np.int64)
+    step = np.asarray(data["step"], dtype=np.float64)
+    global_step = np.arange(step.size, dtype=np.float64)
+    saved: list[Path] = []
+
+    def save_current(name: str) -> None:
+        path = plot_dir / name
+        plt.tight_layout()
+        plt.savefig(path, dpi=160)
+        plt.close()
+        saved.append(path)
+
+    plt.figure(figsize=(10, 5))
+    for ep in np.unique(episode):
+        mask = episode == ep
+        rewards = np.asarray(data["reward"], dtype=np.float64)[mask]
+        plt.plot(step[mask], np.cumsum(rewards), label=f"episode {ep}")
+    plt.xlabel("Step")
+    plt.ylabel("Cumulative reward")
+    plt.title("Episode cumulative reward")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("reward_curve.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["obs1_pole1_angle"], label="pole1 angle")
+    plt.plot(global_step, data["obs2_pole2_angle"], label="pole2 angle")
+    plt.axhline(1.0, color="r", linestyle="--", linewidth=1)
+    plt.axhline(-1.0, color="r", linestyle="--", linewidth=1)
+    plt.xlabel("Global step")
+    plt.ylabel("Normalized angle")
+    plt.title("Pole angles")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("pole_angles.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["obs3_pole1_angular_velocity"], label="pole1 angular velocity")
+    plt.plot(global_step, data["obs4_pole2_angular_velocity"], label="pole2 angular velocity")
+    plt.xlabel("Global step")
+    plt.ylabel("Normalized angular velocity")
+    plt.title("Pole angular velocities")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("pole_angular_velocities.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["obs5_cart_distance"], label="cart distance")
+    plt.plot(global_step, data["obs0_cart_velocity"], label="cart velocity")
+    plt.axhline(1.0, color="r", linestyle="--", linewidth=1)
+    plt.axhline(-1.0, color="r", linestyle="--", linewidth=1)
+    plt.xlabel("Global step")
+    plt.ylabel("Normalized value")
+    plt.title("Cart state")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("cart_state.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["action"], label="action")
+    plt.plot(global_step, np.asarray(data["force"], dtype=np.float64) / 1200.0, label="force / 1200")
+    plt.axhline(1.0, color="r", linestyle="--", linewidth=1)
+    plt.axhline(-1.0, color="r", linestyle="--", linewidth=1)
+    plt.xlabel("Global step")
+    plt.ylabel("Command")
+    plt.title("Control command")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("control_command.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["kp"], label="Kp")
+    plt.plot(global_step, data["ki"], label="Ki")
+    plt.plot(global_step, data["kd"], label="Kd")
+    plt.xlabel("Global step")
+    plt.ylabel("Gain")
+    plt.title("BP-PID gains")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("pid_gains.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["error"], label="error")
+    plt.plot(global_step, data["integral"], label="integral")
+    plt.plot(global_step, data["derivative"], label="derivative")
+    plt.xlabel("Global step")
+    plt.ylabel("PID term")
+    plt.title("PID terms")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("pid_terms.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(global_step, data["loss"], label="loss")
+    plt.xlabel("Global step")
+    plt.ylabel("Loss")
+    plt.title("Online BP pseudo-loss")
+    plt.legend(loc="best")
+    plt.grid(alpha=0.3)
+    save_current("bp_loss.png")
+
+    return saved
+
+
 def evaluate(args: argparse.Namespace) -> dict[str, float]:
     """评估主函数。"""
     import numpy as np
@@ -175,6 +354,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         register_double_cartpole,
     )
 
+    _resolve_output_paths(args)
     register_double_cartpole()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -316,6 +496,46 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         "terminations": float(termination_count),
         "truncations": float(truncation_count),
     }
+
+    saved_figures: list[Path] = []
+    if args.plot_dir is not None and args.csv is not None:
+        saved_figures = _plot_step_csv(args.csv, args.plot_dir)
+
+    if args.summary_json is not None:
+        args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "summary": summary,
+            "episode_rewards": episode_rewards,
+            "episode_lengths": episode_lengths,
+            "terminations": termination_count,
+            "truncations": truncation_count,
+            "args": {
+                key: _json_safe(value)
+                for key, value in vars(args).items()
+            },
+            "outputs": {
+                "csv": str(args.csv) if args.csv is not None else None,
+                "figures": [str(path) for path in saved_figures],
+                "save_model": str(args.save_model) if args.save_model is not None else None,
+                "checkpoint_dir": str(args.checkpoint_dir) if args.checkpoint_dir is not None else None,
+            },
+            "controller": {
+                "device": str(controller.device),
+                "torch": torch.__version__,
+                "error_weights": controller.error_weights.tolist(),
+                "integral_limit": controller.integral_limit,
+                "derivative_limit": controller.derivative_limit,
+                "action_limit": controller.action_limit,
+                "initial_gains": controller.initial_gains.detach().cpu().tolist(),
+                "gain_regularization": controller.gain_regularization,
+            },
+        }
+        args.summary_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     print(
         "评估摘要\n "
         f"环境={DOUBLE_CARTPOLE_ENV_ID}\n "
@@ -325,6 +545,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         f"终止次数={termination_count}\n "
         f"截断次数={truncation_count}\n"
     )
+    if args.csv is not None:
+        print(f"逐步数据={args.csv}")
+    if args.summary_json is not None:
+        print(f"实验摘要={args.summary_json}")
+    if saved_figures:
+        print(f"图像目录={args.plot_dir}")
     return summary
 
 

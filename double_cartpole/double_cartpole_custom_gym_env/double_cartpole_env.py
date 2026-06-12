@@ -135,7 +135,7 @@ class DoubleCartpoleEnv(gym.Env):
         if pole_1_angle is None:
             # 缩小初始角度范围，降低初始难度
             pole_1_angle = float(
-                rng.uniform(89.9 * np.pi / 180, 90.1 * np.pi / 180)
+                rng.uniform(89.0 * np.pi / 180, 90.0 * np.pi / 180)
             )
         alpha = pole_1_angle
 
@@ -160,7 +160,7 @@ class DoubleCartpoleEnv(gym.Env):
         if pole_2_angle is None:
             # 缩小初始角度范围，降低初始难度
             pole_2_angle = float(
-                rng.uniform(89.9 * np.pi / 180, 90.1 * np.pi / 180)
+                rng.uniform(89.0 * np.pi / 180, 90.0 * np.pi / 180)
             )
         betha = pole_2_angle
 
